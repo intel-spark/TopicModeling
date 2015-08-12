@@ -204,7 +204,7 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
             val docId = triplet.dstId
             val termTopicCounter = triplet.srcAttr
             val docTopicCounter = triplet.dstAttr
-            val topics = triplet.attr
+            val topics = triplet.attr.clone()
 
             for (i <- 0 until topics.length) {
               val currentTopic = topics(i)
@@ -741,7 +741,7 @@ class GibbsLDALightSampler extends GibbsLDASampler with Logging with Serializabl
             val docId = triplet.dstId
             val termTopicCounter = triplet.srcAttr
             val docTopicCounter = triplet.dstAttr
-            val topics = triplet.attr
+            val topics = triplet.attr.clone()
 
             if (dD == null || gen.nextDouble() < 1e-6) {
               var dv = dDense(totalTopicCounter, alpha, alphaAS, numTokens)
@@ -1044,7 +1044,7 @@ class GibbsLDASparseSampler extends GibbsLDASampler with Logging with Serializab
             val termId = triplet.srcId
             val termTopicCounter = triplet.srcAttr
             val docTopicCounter = triplet.dstAttr
-            val topics = triplet.attr
+            val topics = triplet.attr.clone()
             termTopicCounter.synchronized {
               docTopicCounter.synchronized {
                 if (lastTermId != termId || gen.nextDouble() < 1e-4) {
