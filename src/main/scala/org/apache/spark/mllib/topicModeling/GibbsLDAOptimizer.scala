@@ -84,10 +84,13 @@ class GibbsLDAOptimizer private[topicModeling](
     val sampledCorpus = sampler.sampleTokens(corpus, totalTopicCounter, innerIter + seed,
       numTokens, numTopics, numTerms, alpha, alphaAS, beta)
     sampledCorpus.edges.persist(storageLevel)
+    sampledCorpus.edges.count()
 
     val counterCorpus = updateCounter(sampledCorpus, numTopics)
     checkpoint(counterCorpus, innerIter, checkpointInterval)
     counterCorpus.vertices.persist(storageLevel)
+    counterCorpus.vertices.count()
+
     totalTopicCounter = collectTotalTopicCounter(counterCorpus, numTopics, numTokens)
 
     corpus.edges.unpersist(false)
@@ -300,15 +303,7 @@ object GibbsLDAOptimizer {
       val gen = new Random(pid)
       iter.flatMap {
         case (docId, doc) =>
-          val bsv = BSV.zeros[Int](doc.size)
-          // TODO should not iterate the vector like this, however, no other iterface available
-          val array = doc.toArray
-          for (i <- 0 until array.size) {
-            val count = array(i).toInt
-            if (count != 0)
-              bsv(i) = count
-          }
-          initializeEdges(gen, bsv, docId, numTopics)
+          initializeEdges(gen, doc, docId, numTopics)
       }
     })
     edges.persist(storageLevel)
@@ -324,19 +319,16 @@ object GibbsLDAOptimizer {
           (partitionStrategy.getPartition(e), Edge(e.srcId, e.dstId, e.attr))
         }.partitionBy(new HashPartitioner(numPartitions)).map(_._2)
         Graph.fromEdges(newEdges, null, storageLevel, storageLevel)
-      case "even" =>
-        val edgeCnt = edges.count
-        val partitions = edges.partitions.length
-        val edgesPerPart = edgeCnt / partitions
-        val newEdges = edges.zipWithIndex.map{ case (edge, idx) =>
-          (idx / edgesPerPart, edge)
-        }.partitionBy(new HashPartitioner(partitions)).map(_._2)
+      case "docIdCluster" =>
+        val newEdges = edges.map { e =>
+          (e.dstId, Edge(e.srcId, e.dstId, e.attr))
+        }.partitionBy(new HashPartitioner(docs.partitions.size)).map(_._2)
         Graph.fromEdges(newEdges, null, storageLevel, storageLevel)
+
       case _ =>
-        throw new IllegalArgumentException(s"invalid values of edgePartitioner are none, degree and even, but got $edgePartitioner")
+        throw new IllegalArgumentException(s"invalid values of edgePartitioner are none, degree and docIdCluster, but got $edgePartitioner")
     }
 
-    // corpus = corpus.partitionBy(PartitionStrategy.EdgePartition2D)
     val resultCorpus = updateCounter(corpus, numTopics).cache()
     resultCorpus.vertices.count()
     resultCorpus.edges.count()
@@ -347,44 +339,33 @@ object GibbsLDAOptimizer {
   }
 
   private def initializeEdges(
-    gen: Random,
-    doc: BSV[Int],
-    docId: DocId,
-    numTopics: Int): Array[Edge[ED]] = {
+     gen: Random,
+     doc: SV,
+     docId: DocId,
+     numTopics: Int): Iterator[Edge[ED]] = {
     assert(docId >= 0)
     val newDocId: DocId = -(docId + 1L)
-    val edges =
-      doc.activeIterator.filter(_._2 > 0).map { case (termId, counter) =>
-        val topics = new Array[Int](counter)
-        for (i <- 0 until counter) {
-          topics(i) = gen.nextInt(numTopics)
-        }
-        Edge(termId, newDocId, topics)
-      }.toArray
-    assert(edges.length > 0)
-    edges
+
+    doc.toBreeze.activeIterator.filter(_._2 > 0).map {case (termId, counter) =>
+      val topics = new Array[Int](counter.toInt)
+      for (i <- 0 until counter.toInt) {
+        topics(i) = gen.nextInt(numTopics)
+      }
+      Edge(termId, newDocId, topics)
+    }
   }
 }
 
 class GibbsLDAModel (
-//                      private[topicModel] val gtc: BDV[Double],
-//                      private[topicModel] val ttc: Array[BSV[Double]],
-                      private[topicModeling] val gtc: BDV[Count],
-                      private[topicModeling] val ttc: Array[BSV[Count]],
-                      val alpha: Float,
-                      val beta: Float,
-                      val alphaAS: Float) extends org.apache.spark.mllib.topicModeling.LDAModel with Serializable {
+    private[topicModeling] val gtc: BDV[Count],
+    private[topicModeling] val ttc: Array[BSV[Count]],
+    val alpha: Float,
+    val beta: Float,
+    val alphaAS: Float) extends org.apache.spark.mllib.topicModeling.LDAModel with Serializable {
 
   @transient private lazy val numTopics = gtc.size
   @transient private lazy val numTerms = ttc.size
   @transient private lazy val numTokens = brzSum(gtc).toLong
-
-//  def this(topicCounts: SDV, topicTermCounts: Array[SSV], alpha: Double, beta: Double) {
-//    this(new BDV[Double](topicCounts.toArray), topicTermCounts.map(t =>
-//def this(topicCounts: SDV, topicTermCounts: Array[SSV], alpha: Float, beta: Float) {
-//  this(new BDV[Count](topicCounts.toArray), topicTermCounts.map(t =>
-//      new BSV(t.indices, t.values, t.size)), alpha, beta, alpha)
-//  }
 
   /** Number of topics */
   def k: Int = numTopics
@@ -433,10 +414,6 @@ class GibbsLDAModel (
       (terms, weights)
     }).toArray
   }
-
-//  def globalTopicCounter = GibbsLDAOptimizerUtils.fromBreezeVector(gtc)
-//
-//  def topicTermCounter = ttc.map(t => GibbsLDAOptimizerUtils.fromBreezeVector(t))
 
   private[topicModeling] def merge(term: Int, counter: BV[Int]) = {
     counter.activeIterator.foreach { case (topic, cn) =>
@@ -532,14 +509,14 @@ private[topicModeling] object GibbsLDAOptimizerUtils {
     while (b <= e) {
       mid = (e + b) >> 1
       val v = index(mid)
-      if (v < key) {
-        b = mid + 1
+      if (scala.math.abs(key-v)<=1e-6) {
+        return mid
       }
       else if (v > key) {
         e = mid - 1
       }
       else {
-        return mid
+        b = mid + 1
       }
     }
     val v = index(mid)

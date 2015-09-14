@@ -17,12 +17,13 @@
 package org.apache.spark.mllib.topicModeling
 
 import java.lang.ref.SoftReference
+import java.util
 import org.apache.spark.Logging
 import org.apache.spark.graphx.impl.GraphImpl
 import org.apache.spark.graphx.{TripletFields, VertexId, Graph}
 import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV, sum => brzSum, StorageVector}
 
-import java.util.{Random, PriorityQueue => JPriorityQueue}
+import java.util.Random
 import org.apache.spark.util.random.XORShiftRandom
 import org.apache.spark.util.collection.AppendOnlyMap
 import scala.reflect.ClassTag
@@ -41,6 +42,68 @@ trait GibbsLDASampler {
                    alpha: Float,
                    alphaAS: Float,
                    beta: Float): Graph[VD, ED]
+}
+
+private[topicModeling] object TermAliasTableCache {
+
+  type VD = GibbsLDAOptimizer.VD
+  type ED = GibbsLDAOptimizer.ED
+  type Count = GibbsLDAOptimizer.Count
+
+  private var content = new AppendOnlyMap[Int, SoftReference[(GibbsAliasTable, Float)]]()
+
+  private def wSparse(
+                       totalTopicCounter: BDV[Count],
+                       termTopicCounter: VD,
+                       numTokens: Long,
+                       numTerms: Int,
+                       alpha: Float,
+                       alphaAS: Float,
+                       beta: Float): (Float, BSV[Float]) = {
+    val numTopics = totalTopicCounter.length
+    val alphaSum = alpha * numTopics
+    val termSum = numTokens - 1f + alphaAS * numTopics
+    val betaSum = numTerms * beta
+    val w = BSV.zeros[Float](numTopics)
+    var sum = 0.0f
+    termTopicCounter.activeIterator.filter(_._2 > 0).foreach { t =>
+      val topic = t._1
+      val count = t._2
+      val last = count * alphaSum * (totalTopicCounter(topic) + alphaAS) /
+        ((totalTopicCounter(topic) + betaSum) * termSum)
+      w(topic) = last
+      sum += last
+    }
+    (sum, w)
+  }
+
+  def get(totalTopicCounter: BDV[Count],
+          termTopicCounter: VD,
+          termId: VertexId,
+          numTokens: Long,
+          numTerms: Int,
+          alpha: Float,
+          alphaAS: Float,
+          beta: Float): (GibbsAliasTable, Float) = {
+      if(content(termId.toInt) == null) {
+        synchronized {
+          if(content(termId.toInt) == null) {
+            val sv = wSparse(totalTopicCounter, termTopicCounter,
+              numTokens, numTerms, alpha, alphaAS, beta)
+
+            val table = new GibbsAliasTable(sv._2.activeSize)
+            GibbsAliasTable.generateAlias(sv._2, sv._1, table)
+
+            content(termId.toInt) = new SoftReference((table, sv._1))
+          }
+      }
+    }
+    content(termId.toInt).get
+  }
+
+  def clear() = {
+    content = new AppendOnlyMap[Int, SoftReference[(GibbsAliasTable, Float)]]()
+  }
 }
 
 private[topicModeling] class GibbsAliasTable(initUsed: Int) extends Serializable {
@@ -84,13 +147,6 @@ private[topicModeling] class GibbsAliasTable(initUsed: Int) extends Serializable
 }
 
 private[topicModeling] object GibbsAliasTable {
-  @transient private lazy val tableOrdering = new scala.math.Ordering[(Int, Float)] {
-    override def compare(x: (Int, Float), y: (Int, Float)): Int = {
-      Ordering.Double.compare(x._2, y._2)
-    }
-  }
-  @transient private lazy val tableReverseOrdering = tableOrdering.reverse
-
   def generateAlias(sv: BV[Float]): GibbsAliasTable = {
     val used = sv.activeSize
     val sum = brzSum(sv)
@@ -110,37 +166,54 @@ private[topicModeling] object GibbsAliasTable {
                      table: GibbsAliasTable): GibbsAliasTable = {
     table.reset(used)
     val pMean = 1.0f / used
-    val lq = new JPriorityQueue[(Int, Float)](used, tableOrdering)
-    val hq = new JPriorityQueue[(Int, Float)](used, tableReverseOrdering)
+
+    val lq = new util.ArrayDeque[(Int, Float)]()
+    val hq = new util.ArrayDeque[(Int, Float)]()
 
     probs.slice(0, used).foreach { pair =>
       val i = pair._1
       val pi = pair._2 / sum
       if (pi < pMean) {
-        lq.add((i, pi))
+        if(pMean-pi<=1e-6) {
+          lq.addFirst(i, pi)
+        } else {
+          lq.add((i, pi))
+        }
       } else {
-        hq.add((i, pi))
+        if(pi-pMean<=1e-6) {
+          hq.addFirst(i, pi)
+        } else {
+          hq.add((i, pi))
+        }
       }
     }
 
     var offset = 0
     while (!lq.isEmpty & !hq.isEmpty) {
-      val (i, pi) = lq.remove()
-      val (h, ph) = hq.remove()
+      val (i, pi) = lq.removeLast()
+      val (h, ph) = hq.removeLast()
       table.l(offset) = i
       table.h(offset) = h
       table.p(offset) = pi
       val pd = ph - (pMean - pi)
       if (pd >= pMean) {
-        hq.add((h, pd))
+        if(pd-pMean<=1e-6) {
+          hq.addFirst(h, pd)
+        } else {
+          hq.add((h, pd))
+        }
       } else {
-        lq.add((h, pd))
+        if(pMean-pd<=1e-6) {
+          lq.addFirst(h, pd)
+        } else {
+          lq.add((h, pd))
+        }
       }
       offset += 1
     }
     while (!hq.isEmpty) {
-      val (h, ph) = hq.remove()
-      assert(ph - pMean < 1e-6)
+      val (h, ph) = hq.removeLast()
+      assert(ph - pMean < 1e-4)
       table.l(offset) = h
       table.h(offset) = h
       table.p(offset) = ph
@@ -148,8 +221,8 @@ private[topicModeling] object GibbsAliasTable {
     }
 
     while (!lq.isEmpty) {
-      val (i, pi) = lq.remove()
-      assert(pMean - pi < 1e-6)
+      val (i, pi) = lq.removeLast()
+      assert(pMean - pi < 1e-4)
       table.l(offset) = i
       table.h(offset) = i
       table.p(offset) = pi
@@ -184,13 +257,15 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
                    beta: Float): Graph[VD, ED] = {
     val parts = graph.edges.partitions.size
 
+    TermAliasTableCache.clear()
     val newGraph = graph.mapTriplets(
       (pid, iter) => {
         val gen = new XORShiftRandom(parts * innerIter + pid)
         // table is a per term data structure
         // in GraphX, edges in a partition are clustered by source IDs (term id in this case)
         // so, use below simple cache to avoid calculating table each time
-        val lastTable = new GibbsAliasTable(numTopics)
+        //val lastTable = new GibbsAliasTable(numTopics)
+        var lastTable: GibbsAliasTable = null
         var lastVid: VertexId = -1
         var lastWSum = 0.0f
         val dv = tDense(totalTopicCounter, numTokens, numTerms, alpha, alphaAS, beta)
@@ -207,16 +282,20 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
             val topics = triplet.attr.clone()
 
             for (i <- 0 until topics.length) {
-              val currentTopic = topics(i)
-              docTopicCounter.synchronized {
-                termTopicCounter.synchronized {
-                  dSparse(totalTopicCounter, termTopicCounter, docTopicCounter, dData,
-                    currentTopic, numTokens, numTerms, alpha, alphaAS, beta)
+               val currentTopic = topics(i)
+               dSparse(totalTopicCounter, termTopicCounter, docTopicCounter, dData,
+                 currentTopic, numTokens, numTerms, alpha, alphaAS, beta)
+
                   if (lastVid != termId || gen.nextDouble() < 1e-4) {
-                    lastWSum = wordTable(lastTable, totalTopicCounter, termTopicCounter,
-                      termId, numTokens, numTerms, alpha, alphaAS, beta)
+//                    lastWSum = wordTable(lastTable, totalTopicCounter, termTopicCounter,
+  //                    termId, numTokens, numTerms, alpha, alphaAS, beta)
+                      val res = TermAliasTableCache.get(totalTopicCounter, termTopicCounter, termId,
+                                                    numTokens, numTerms, alpha, alphaAS, beta)
+                      lastWSum = res._2
+                      lastTable = res._1
                     lastVid = termId
                   }
+
                   val newTopic = tokenSampling(gen, t, tSum, lastTable, termTopicCounter, lastWSum,
                     docTopicCounter, dData, currentTopic)
 
@@ -233,8 +312,6 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
                     totalTopicCounter(currentTopic) -= 1
                     totalTopicCounter(newTopic) += 1
                   }
-                }
-              }
             }
             topics
         }
@@ -288,15 +365,14 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
                        alpha: Float,
                        alphaAS: Float,
                        beta: Float): Unit = {
-    val data = docTopicCounter.data
-    val used = docTopicCounter.activeSize
-
     // val termSum = numTokens - 1D + alphaAS * numTopics
     val betaSum = numTerms * beta
     var sum = 0.0f
-    for (i <- 0 until used) {
-      val topic = docTopicCounter.indexAt(i)
-      val count = data(i)
+    var i = 0
+
+    docTopicCounter.activeIterator.filter(_._2 > 0).foreach { t =>
+      val topic = t._1
+      val count = t._2
       val adjustment = if (currentTopic == topic) -1F else 0
       val last = (count + adjustment) * (termTopicCounter(topic) + adjustment + beta) /
         (totalTopicCounter(topic) + adjustment + betaSum)
@@ -305,6 +381,7 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
 
       sum += last
       d(i) = sum
+      i += 1
     }
   }
 
@@ -341,7 +418,8 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
    * where:
    * \bar{\beta}=\sum_{w}{\beta}_{w}
    * \bar{\alpha}=\sum_{k}{\alpha}_{k}
-   * \bar{\acute{\alpha}}=\bar{\acute{\alpha}}=\sum_{k}\acute{\alpha}
+   * \bar{\acute{\alpha}}=\barval lq = new util.ArrayDeque[(Int, Float)]()
+    val hq = new util.ArrayDeque[(Int, Float)](){\acute{\alpha}}=\sum_{k}\acute{\alpha}
    * {n}_{kd} number of tokens in document d that are assigned to topic k
    * {n}_{kw} number of tokens with word w (across all docs) that are assigned to topic k
    * {n}_{k} number of tokens across all docs that are assigned to topic k
@@ -404,16 +482,17 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
   }
 
   private def sampleSV(gen: Random, table: GibbsAliasTable, sv: VD, currentTopic: Int): Int = {
-    val docTopic = table.sampleAlias(gen)
-    if (docTopic == currentTopic) {
+    var docTopic = table.sampleAlias(gen)
+
+    while(docTopic == currentTopic) {
+
       val svCounter = sv(currentTopic)
-      // processing method is not appropriate here,
-      // if we drop topic of current sampled token
-      // svCounter == 1 && table.length > 1, however topic of current sampled token contains other tokens
-      // svCounter > 1 && gen.nextDouble() < 1.0 / svCounter, probability that sampled topic belongs to current topic is 1/svCounter
+
       if ((svCounter == 1 && table.used > 1) ||
-        (svCounter > 1 && gen.nextDouble() < 1.0 / svCounter)) {
-        return sampleSV(gen, table, sv, currentTopic)
+        (svCounter > 1 && gen.nextFloat() < 1.0f / svCounter)) {
+        docTopic = table.sampleAlias(gen)
+      } else {
+        return docTopic
       }
     }
     docTopic

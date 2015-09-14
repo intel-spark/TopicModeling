@@ -265,9 +265,8 @@ object LDAExample {
     // One document per line in each text file. If the input consists of many small files,
     // this can result in a large number of small partitions, which can degrade performance.
     // In this case, consider using coalesce() to create fewer, larger partitions.
-    val textRDD: RDD[String] = sc.textFile(paths.mkString(","), Math.max(1, partitions))
+    val textRDD: RDD[String] = sc.textFile(paths.mkString(","), Math.max(1, partitions)).coalesce(partitions)
 
-//    val test = textRDD.coalesce(partitions)
 
     // Split text into words
     val tokenizer = new SimpleTokenizer(sc, stopwordFile)
