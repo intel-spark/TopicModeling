@@ -44,67 +44,67 @@ trait GibbsLDASampler {
                    beta: Float): Graph[VD, ED]
 }
 
-private[topicModeling] object TermAliasTableCache {
-
-  type VD = GibbsLDAOptimizer.VD
-  type ED = GibbsLDAOptimizer.ED
-  type Count = GibbsLDAOptimizer.Count
-
-  private var content = new AppendOnlyMap[Int, SoftReference[(GibbsAliasTable, Float)]]()
-
-  private def wSparse(
-                       totalTopicCounter: BDV[Count],
-                       termTopicCounter: VD,
-                       numTokens: Long,
-                       numTerms: Int,
-                       alpha: Float,
-                       alphaAS: Float,
-                       beta: Float): (Float, BSV[Float]) = {
-    val numTopics = totalTopicCounter.length
-    val alphaSum = alpha * numTopics
-    val termSum = numTokens - 1f + alphaAS * numTopics
-    val betaSum = numTerms * beta
-    val w = BSV.zeros[Float](numTopics)
-    var sum = 0.0f
-    termTopicCounter.activeIterator.filter(_._2 > 0).foreach { t =>
-      val topic = t._1
-      val count = t._2
-      val last = count * alphaSum * (totalTopicCounter(topic) + alphaAS) /
-        ((totalTopicCounter(topic) + betaSum) * termSum)
-      w(topic) = last
-      sum += last
-    }
-    (sum, w)
-  }
-
-  def get(totalTopicCounter: BDV[Count],
-          termTopicCounter: VD,
-          termId: VertexId,
-          numTokens: Long,
-          numTerms: Int,
-          alpha: Float,
-          alphaAS: Float,
-          beta: Float): (GibbsAliasTable, Float) = {
-      if(content(termId.toInt) == null) {
-        synchronized {
-          if(content(termId.toInt) == null) {
-            val sv = wSparse(totalTopicCounter, termTopicCounter,
-              numTokens, numTerms, alpha, alphaAS, beta)
-
-            val table = new GibbsAliasTable(sv._2.activeSize)
-            GibbsAliasTable.generateAlias(sv._2, sv._1, table)
-
-            content(termId.toInt) = new SoftReference((table, sv._1))
-          }
-      }
-    }
-    content(termId.toInt).get
-  }
-
-  def clear() = {
-    content = new AppendOnlyMap[Int, SoftReference[(GibbsAliasTable, Float)]]()
-  }
-}
+//private[topicModeling] object TermAliasTableCache {
+//
+//  type VD = GibbsLDAOptimizer.VD
+//  type ED = GibbsLDAOptimizer.ED
+//  type Count = GibbsLDAOptimizer.Count
+//
+//  private var content = new AppendOnlyMap[Int, SoftReference[(GibbsAliasTable, Float)]]()
+//
+//  private def wSparse(
+//                       totalTopicCounter: BDV[Count],
+//                       termTopicCounter: VD,
+//                       numTokens: Long,
+//                       numTerms: Int,
+//                       alpha: Float,
+//                       alphaAS: Float,
+//                       beta: Float): (Float, BSV[Float]) = {
+//    val numTopics = totalTopicCounter.length
+//    val alphaSum = alpha * numTopics
+//    val termSum = numTokens - 1f + alphaAS * numTopics
+//    val betaSum = numTerms * beta
+//    val w = BSV.zeros[Float](numTopics)
+//    var sum = 0.0f
+//    termTopicCounter.activeIterator.filter(_._2 > 0).foreach { t =>
+//      val topic = t._1
+//      val count = t._2
+//      val last = count * alphaSum * (totalTopicCounter(topic) + alphaAS) /
+//        ((totalTopicCounter(topic) + betaSum) * termSum)
+//      w(topic) = last
+//      sum += last
+//    }
+//    (sum, w)
+//  }
+//
+//  def get(totalTopicCounter: BDV[Count],
+//          termTopicCounter: VD,
+//          termId: VertexId,
+//          numTokens: Long,
+//          numTerms: Int,
+//          alpha: Float,
+//          alphaAS: Float,
+//          beta: Float): (GibbsAliasTable, Float) = {
+//      if(content(termId.toInt) == null) {
+//        synchronized {
+//          if(content(termId.toInt) == null) {
+//            val sv = wSparse(totalTopicCounter, termTopicCounter,
+//              numTokens, numTerms, alpha, alphaAS, beta)
+//
+//            val table = new GibbsAliasTable(sv._2.activeSize)
+//            GibbsAliasTable.generateAlias(sv._2, sv._1, table)
+//
+//            content(termId.toInt) = new SoftReference((table, sv._1))
+//          }
+//      }
+//    }
+//    content(termId.toInt).get
+//  }
+//
+//  def clear() = {
+//    content = new AppendOnlyMap[Int, SoftReference[(GibbsAliasTable, Float)]]()
+//  }
+//}
 
 private[topicModeling] class GibbsAliasTable(initUsed: Int) extends Serializable {
 
@@ -257,15 +257,13 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
                    beta: Float): Graph[VD, ED] = {
     val parts = graph.edges.partitions.size
 
-    TermAliasTableCache.clear()
     val newGraph = graph.mapTriplets(
       (pid, iter) => {
         val gen = new XORShiftRandom(parts * innerIter + pid)
         // table is a per term data structure
         // in GraphX, edges in a partition are clustered by source IDs (term id in this case)
         // so, use below simple cache to avoid calculating table each time
-        //val lastTable = new GibbsAliasTable(numTopics)
-        var lastTable: GibbsAliasTable = null
+        val lastTable = new GibbsAliasTable(numTopics)
         var lastVid: VertexId = -1
         var lastWSum = 0.0f
         val dv = tDense(totalTopicCounter, numTokens, numTerms, alpha, alphaAS, beta)
@@ -287,12 +285,8 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
                  currentTopic, numTokens, numTerms, alpha, alphaAS, beta)
 
                   if (lastVid != termId || gen.nextDouble() < 1e-4) {
-//                    lastWSum = wordTable(lastTable, totalTopicCounter, termTopicCounter,
-  //                    termId, numTokens, numTerms, alpha, alphaAS, beta)
-                      val res = TermAliasTableCache.get(totalTopicCounter, termTopicCounter, termId,
-                                                    numTokens, numTerms, alpha, alphaAS, beta)
-                      lastWSum = res._2
-                      lastTable = res._1
+                    lastWSum = wordTable(lastTable, totalTopicCounter, termTopicCounter,
+                      termId, numTokens, numTerms, alpha, alphaAS, beta)
                     lastVid = termId
                   }
 
@@ -539,6 +533,7 @@ class GibbsLDAFastSampler extends GibbsLDASampler with Serializable with Logging
                   termId, numTokens, numTerms, alpha, alphaAS, beta)
                 lastVid = termId
               }
+
               val newTopic = tokenSampling(gen, t, tSum, lastTable, termTopicCounter, lastWSum,
                 docTopicCounter, dData, currentTopic)
 
@@ -570,7 +565,7 @@ class GibbsLDAFastSampler extends GibbsLDASampler with Serializable with Logging
     val genSum = gen.nextFloat() * distSum
     if (genSum < dSum) {
       val dGenSum = gen.nextFloat() * dSum
-      val pos = binarySearchInterval(dData, dGenSum, 0, used, true)
+      val pos = GibbsLDAOptimizerUtils.binarySearchInterval(dData, dGenSum, 0, used, true)
       docTopicCounter.indexAt(pos)
     } else if (genSum < (dSum + wSum)) {
       sampleSV(gen, w, termTopicCounter, currentTopic)
@@ -659,9 +654,10 @@ class GibbsLDAFastSampler extends GibbsLDASampler with Serializable with Logging
     // val termSum = numTokens - 1D + alphaAS * numTopics
     val betaSum = numTerms * beta
     var sum = 0.0f
-    for (i <- 0 until used) {
-      val topic = docTopicCounter.indexAt(i)
-      val count = data(i)
+    var i = 0
+    docTopicCounter.activeIterator.filter(_._2 > 0).foreach { t =>
+      val topic = t._1
+      val count = t._2
       val adjustment = if (currentTopic == topic) -1F else 0
       val last = (count + adjustment) * (termTopicCounter(topic) + adjustment + beta) /
         (totalTopicCounter(topic) + adjustment + betaSum)
@@ -669,6 +665,7 @@ class GibbsLDAFastSampler extends GibbsLDASampler with Serializable with Logging
       //  ((totalTopicCounter(topic) + adjustment + betaSum) * termSum)
       sum += last
       d(i) = sum
+      i += 1
     }
   }
 
@@ -708,53 +705,6 @@ class GibbsLDAFastSampler extends GibbsLDASampler with Serializable with Logging
       }
     }
     docTopic
-  }
-
-  def binarySearchInterval(
-                            index: Array[Float],
-                            key: Float,
-                            begin: Int,
-                            end: Int,
-                            greater: Boolean): Int = {
-    if (begin == end) {
-      return if (greater) end else begin - 1
-    }
-    var b = begin
-    var e = end - 1
-
-    var mid: Int = (e + b) >> 1
-    while (b <= e) {
-      mid = (e + b) >> 1
-      val v = index(mid)
-      if (v < key) {
-        b = mid + 1
-      }
-      else if (v > key) {
-        e = mid - 1
-      }
-      else {
-        return mid
-      }
-    }
-    val v = index(mid)
-    mid = if ((greater && v >= key) || (!greater && v <= key)) {
-      mid
-    }
-    else if (greater) {
-      mid + 1
-    }
-    else {
-      mid - 1
-    }
-
-    if (greater) {
-      if (mid < end) assert(index(mid) >= key)
-      if (mid > 0) assert(index(mid - 1) <= key)
-    } else {
-      if (mid > 0) assert(index(mid) <= key)
-      if (mid < end - 1) assert(index(mid + 1) >= key)
-    }
-    mid
   }
 }
 
