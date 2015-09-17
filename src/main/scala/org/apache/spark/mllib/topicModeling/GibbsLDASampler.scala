@@ -213,7 +213,7 @@ private[topicModeling] object GibbsAliasTable {
     }
     while (!hq.isEmpty) {
       val (h, ph) = hq.removeLast()
-      assert(ph - pMean < 1e-4)
+//      assert(ph - pMean < 1e-4)
       table.l(offset) = h
       table.h(offset) = h
       table.p(offset) = ph
@@ -222,7 +222,7 @@ private[topicModeling] object GibbsAliasTable {
 
     while (!lq.isEmpty) {
       val (i, pi) = lq.removeLast()
-      assert(pMean - pi < 1e-4)
+//      assert(pMean - pi < 1e-4)
       table.l(offset) = i
       table.h(offset) = i
       table.p(offset) = pi
