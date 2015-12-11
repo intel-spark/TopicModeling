@@ -27,11 +27,15 @@ import org.apache.spark.serializer.KryoRegistrator
 import org.apache.spark.storage.StorageLevel
 
 import breeze.linalg.{Vector => BV, DenseVector => BDV, SparseVector => BSV, StorageVector,
-  sum => brzSum, DenseMatrix => BDM, Matrix => BM, CSCMatrix => BSM}
+  sum => brzSum, norm => brzNorm, DenseMatrix => BDM, Matrix => BM, CSCMatrix => BSM}
 
-import org.apache.spark.mllib.linalg.{DenseVector => SDV, SparseVector => SSV, DenseMatrix => SDM, SparseMatrix => SSM, Vector => SV, Matrix}
+import org.apache.spark.mllib.linalg.{DenseVector => SDV, SparseVector => SSV,
+  DenseMatrix => SDM, SparseMatrix => SSM, Vector => SV, Matrix}
 
 import GibbsLDAOptimizer._
+
+import scala.reflect.ClassTag
+
 /**
  *
  * Adapted from Spark PRs(#1405 and #4807) and JIRA SPARK-5556 (https://github.com/witgo/spark/tree/lda_Gibbs,
@@ -60,7 +64,7 @@ class GibbsLDAOptimizer private[topicModeling](
    * Initializer for the optimizer. LDA passes the common parameters to the optimizer and
    * the internal structure can be initialized properly.
    */
-  override def initialize(docs: RDD[(Long, SV)], lda: org.apache.spark.mllib.topicModeling.LDA): LDAOptimizer = {
+  override def initialize(docs: RDD[(Long, SV)], lda: LDA): LDAOptimizer = {
     alpha = lda.getAlpha.toFloat
     beta = lda.getBeta.toFloat
     numTopics = lda.getK
@@ -81,6 +85,15 @@ class GibbsLDAOptimizer private[topicModeling](
    */
   def next(): LDAOptimizer = {
 
+    gibbsSampling()
+
+    if (printPerplexity) {
+      println(s"Perplexity of $innerIter-th is ${perplexity}")
+    }
+    this
+  }
+
+  private def gibbsSampling(): Unit = {
     val sampledCorpus = sampler.sampleTokens(corpus, totalTopicCounter, innerIter + seed,
       numTokens, numTopics, numTerms, alpha, alphaAS, beta)
     sampledCorpus.edges.persist(storageLevel)
@@ -100,11 +113,6 @@ class GibbsLDAOptimizer private[topicModeling](
     corpus = counterCorpus
 
     innerIter += 1
-
-    if (printPerplexity) {
-      println(s"Perplexity of $innerIter-th is ${perplexity}")
-    }
-    this
   }
 
   /**
@@ -112,12 +120,8 @@ class GibbsLDAOptimizer private[topicModeling](
    * @param iterationTimes
    * @return
    */
-  def getLDAModel(iterationTimes: Array[Double]): org.apache.spark.mllib.topicModeling.LDAModel = {
-    val ldaModel:GibbsLDAModel = GibbsLDAModel(numTopics, numTerms, alpha, beta)
-    termVertices.collect().foreach { case (term, counter) =>
-      ldaModel.merge(term.toInt, counter)
-    }
-    ldaModel.ttc.foreach(_.compact())
+  override def getLDAModel(iterationTimes: Array[Double]): LDAModel = {
+    val ldaModel:GibbsLDAModel = saveModel(1)
     ldaModel
   }
 
@@ -243,6 +247,70 @@ class GibbsLDAOptimizer private[topicModeling](
 
     math.exp(-1 * termProb / totalSize)
   }
+
+  /**
+   * Save the term-topic related model
+   * @param totalIter
+   */
+  def saveModel(totalIter: Int = 1): GibbsLDAModel = {
+    var termTopicCounter: RDD[(VertexId, VD)] = null
+    for (iter <- 1 to totalIter) {
+      logInfo(s"Save TopicModel (Iteration $iter/$totalIter)")
+      var previousTermTopicCounter = termTopicCounter
+      gibbsSampling()
+      val newTermTopicCounter = termVertices
+      termTopicCounter = Option(termTopicCounter).map(_.join(newTermTopicCounter).map {
+        case (term, (a, b)) =>
+          var c: VD = null
+          if(a.isInstanceOf[BSV[Count]] && b.isInstanceOf[BSV[Count]]) {
+            c = a.asInstanceOf[BSV[Count]] :+ b.asInstanceOf[BSV[Count]]
+          } else if(a.isInstanceOf[BDV[Count]] && b.isInstanceOf[BDV[Count]]){
+            c = a.asInstanceOf[BDV[Count]] :+ b.asInstanceOf[BDV[Count]]
+          } else if(a.isInstanceOf[BDV[Count]]) {
+            c = a.asInstanceOf[BDV[Count]] :+ b.asInstanceOf[BSV[Count]].toDenseVector
+          } else {
+            c = a.asInstanceOf[BSV[Count]].toDenseVector :+ b.asInstanceOf[BDV[Count]]
+          }
+          (term, c)
+      }).getOrElse(newTermTopicCounter)
+
+      termTopicCounter.persist(storageLevel).count()
+      Option(previousTermTopicCounter).foreach(_.unpersist(blocking = false))
+      previousTermTopicCounter = termTopicCounter
+    }
+    val rand = new Random()
+    val ttc = termTopicCounter.mapValues(c => {
+      if (c.isInstanceOf[BDV[Count]]) {
+        val dv = c.asInstanceOf[BDV[Count]]
+        val nc = new BDV[Count](dv.data.map (v => {
+          val mid = v.toDouble / totalIter
+          val l = math.floor(mid)
+          if (rand.nextDouble() > mid - l) {
+            l
+          } else {
+            l + 1
+          }
+        }.asInstanceOf[Count]))
+        nc.asInstanceOf[StorageVector[Count]]
+      } else {
+        val sv = c.asInstanceOf[BSV[Count]]
+        val nc = new BSV[Count](sv.index.slice(0, sv.used), sv.data.slice(0, sv.used).map(v => {
+          val mid = v.toDouble / totalIter
+          val l = math.floor(mid)
+          if (rand.nextDouble() > mid - l) {
+            l
+          } else {
+            l + 1
+          }
+        }.asInstanceOf[Count]), c.length)
+        nc
+      }
+    })
+
+    ttc.persist(storageLevel)
+    val gtc = ttc.map(_._2).aggregate(BDV.zeros[Count](numTopics))(_ :+= _, _ :+= _)
+    new GibbsLDAModel(gtc, ttc, numTerms, alpha, beta, alphaAS)
+  }
 }
 
 object GibbsLDAOptimizer {
@@ -358,13 +426,13 @@ object GibbsLDAOptimizer {
 
 class GibbsLDAModel (
     private[topicModeling] val gtc: BDV[Count],
-    private[topicModeling] val ttc: Array[BSV[Count]],
+    private[topicModeling] val ttc: RDD[(VertexId, VD)],
+    val numTerms: Int,
     val alpha: Float,
     val beta: Float,
     val alphaAS: Float) extends org.apache.spark.mllib.topicModeling.LDAModel with Serializable {
 
   @transient private lazy val numTopics = gtc.size
-  @transient private lazy val numTerms = ttc.size
   @transient private lazy val numTokens = brzSum(gtc).toLong
 
   /** Number of topics */
@@ -380,9 +448,18 @@ class GibbsLDAModel (
    */
   def topicsMatrix: Matrix = {
     val matrix = BDM.zeros[Double](numTerms, numTopics)
+
+    val ttcArray = Array.fill(numTerms.toInt) {
+      BSV.zeros[Count](numTopics)
+    }
+    ttc.collect().foreach { case (termId, vector) =>
+      ttcArray(termId.toInt) :+= vector
+    }
+
     for (termId <- 0 until numTerms) {
+      val sv = ttcArray(termId)
       for (topicId <- 0 until numTopics) {
-        matrix(termId, topicId) = ttc(termId)(topicId)
+        matrix(termId, topicId) = sv(topicId)
       }
     }
     GibbsLDAOptimizerUtils.fromBreezeMatrix(matrix)
@@ -401,39 +478,25 @@ class GibbsLDAModel (
    *          Each topic's terms are sorted in order of decreasing weight.
    */
   def describeTopics(maxTermsPerTopic: Int): Array[(Array[Int], Array[Double])] = {
+    val ttcArray = Array.fill(numTerms.toInt) {
+      BSV.zeros[Count](numTopics)
+    }
+    ttc.collect().foreach { case (termId, vector) =>
+      ttcArray(termId.toInt) :+= vector
+    }
+
     (0 until numTopics).map(topicId => {
-      val terms = (0 until numTerms).map(termId => (termId, ttc(termId)(topicId).toDouble))
+      val terms = (0 until numTerms).map(termId => (termId, ttcArray(termId)(topicId).toDouble))
         .sortBy(_._2)(Ordering[Double].reverse)
         .take(maxTermsPerTopic)
         .map(_._1).toArray
-      val weights = terms.map(ttc(_)(topicId).toDouble)
+      val weights = terms.map(ttcArray(_)(topicId).toDouble)
       val wsum = weights.sum
       if (wsum > 1E-5) {
         (0 until weights.length).foreach(weights(_) /= wsum)
       }
       (terms, weights)
     }).toArray
-  }
-
-  private[topicModeling] def merge(term: Int, counter: BV[Int]) = {
-    counter.activeIterator.foreach { case (topic, cn) =>
-      mergeOne(term, topic, cn)
-    }
-    this
-  }
-
-  private[topicModeling] def mergeOne(term: Int, topic: Int, inc: Int) = {
-    gtc(topic) += inc
-    ttc(term)(topic) += inc
-    this
-  }
-
-  private[topicModeling] def merge(other: GibbsLDAModel) = {
-    gtc :+= other.gtc
-    for (i <- 0 until ttc.length) {
-      ttc(i) :+= other.ttc(i)
-    }
-    this
   }
 
   /**
@@ -444,16 +507,25 @@ class GibbsLDAModel (
    */
   def predict(documents: RDD[(Long, SV)],
               optimizer: GibbsLDAOptimizer,
-              totalIter: Int = 25): RDD[(Long, VD)] = {
+              totalIter: Int = 25,
+              burnIn: Int = 22): RDD[(Long, SV)] = {
 
-    val previousCorpus: Graph[VD, ED] = initializeCorpus(documents, numTopics, optimizer.getStorageLevel(), optimizer.edgePartitioner)
+    val previousCorpus: Graph[VD, ED] = initializeCorpus(documents, numTopics,
+      optimizer.getStorageLevel(), optimizer.edgePartitioner)
 
-    var corpus: Graph[VD, ED] = previousCorpus.mapVertices {(id, attr) =>
-      val newAttr = if(id > 0) Some(ttc(id.toInt)).getOrElse(attr) else attr
-      newAttr
+    var corpus = previousCorpus.outerJoinVertices(ttc) { (vid, c, v) =>
+      if (vid >= 0) {
+        assert(v.isDefined)
+      }
+      v.getOrElse(c)
     }
-
+    corpus.persist(optimizer.getStorageLevel)
     corpus.vertices.count()
+    corpus.edges.count()
+    previousCorpus.edges.unpersist(blocking = false)
+    previousCorpus.vertices.unpersist(blocking = false)
+
+    var docTopicCounter: RDD[(VertexId, VD)] = null
     for(i <- 1 to totalIter) {
       val previousCorpus = corpus
 
@@ -470,29 +542,72 @@ class GibbsLDAModel (
 
       sampledCorpus.edges.unpersist(false)
       sampledCorpus.vertices.unpersist(false)
+
+      if (i > burnIn) {
+        var previousDocTopicCounter = docTopicCounter
+        val newTermTopicCounter = corpus.vertices.filter(t => t._1 < 0)
+        docTopicCounter = Option(docTopicCounter).map(_.join(newTermTopicCounter).map {
+          case (docId, (a, b)) => {
+            var c: VD = null
+            if(a.isInstanceOf[BSV[Count]] && b.isInstanceOf[BSV[Count]]) {
+              c = a.asInstanceOf[BSV[Count]] :+ b.asInstanceOf[BSV[Count]]
+            } else if(a.isInstanceOf[BDV[Count]] && b.isInstanceOf[BDV[Count]]){
+              c = a.asInstanceOf[BDV[Count]] :+ b.asInstanceOf[BDV[Count]]
+            } else if(a.isInstanceOf[BDV[Count]]) {
+              c = a.asInstanceOf[BDV[Count]] :+ b.asInstanceOf[BSV[Count]].toDenseVector
+            } else {
+              c = a.asInstanceOf[BSV[Count]].toDenseVector :+ b.asInstanceOf[BDV[Count]]
+            }
+            (docId, c)
+          }
+        }).getOrElse(newTermTopicCounter)
+
+        docTopicCounter.persist(optimizer.getStorageLevel).count()
+        Option(previousDocTopicCounter).foreach(_.unpersist(blocking = false))
+        previousDocTopicCounter = docTopicCounter
+      }
     }
-
-    corpus.vertices.filter(t => t._1 < 0)
-  }
-}
-
-object GibbsLDAModel {
-  /**
-   * create GibbsLDAModel
-   * @param numTopics number of topics
-   * @param numTerms number of terms (vocabulary)
-   * @param alpha alpha
-   * @param beta beta
-   * @return
-   */
-  def apply(numTopics: Int, numTerms: Int, alpha: Float = 0.1f, beta: Float = 0.01f) = {
-    val gtc = BDV.zeros[Count](numTopics)
-    val ttc = (0 until numTerms).map(_ => BSV.zeros[Count](numTopics)).toArray
-    new GibbsLDAModel(gtc, ttc, alpha, beta, alpha)
+    docTopicCounter.map { case (docId, v) =>
+      if(v.isInstanceOf[BDV[Count]]) {
+        val dv = v.asInstanceOf[BDV[Count]]
+        val norm = brzNorm(dv, 1)
+        (docId, GibbsLDAOptimizerUtils.fromBreezeConv[Double](dv.map(_.toDouble) / norm ))
+      } else {
+        val sv = v.asInstanceOf[BSV[Count]]
+        val norm = brzNorm(sv, 1)
+        (docId, GibbsLDAOptimizerUtils.fromBreezeConv[Double](sv.map(_.toDouble) / norm))
+      }
+    }
   }
 }
 
 private[topicModeling] object GibbsLDAOptimizerUtils {
+
+  private def _conv[T1: ClassTag, T2: ClassTag](data: Array[T1]): Array[T2] = {
+    data.map(_.asInstanceOf[T2]).array
+  }
+
+  def fromBreezeConv[T: ClassTag](breezeVector: BV[T]): SV = {
+    implicit val conv: Array[T] => Array[Double] = _conv[T, Double]
+
+    breezeVector match {
+      case v: BDV[T] =>
+        if (v.offset == 0 && v.stride == 1 && v.length == v.data.length) {
+          new SDV(v.data)
+        } else {
+          new SDV(v.toArray) // Can't use underlying array directly, so make a new one
+        }
+      case v: BSV[T] =>
+        if (v.index.length == v.used) {
+          new SSV(v.length, v.index, _conv[T, Double](v.data))
+        } else {
+          new SSV(v.length, v.index.slice(0, v.used), v.data.slice(0, v.used))
+        }
+      case v: BV[T] =>
+        sys.error("Unsupported Breeze vector type: " + v.getClass.getName)
+    }
+  }
+
   def binarySearchInterval(
                             index: Array[Float],
                             key: Float,
