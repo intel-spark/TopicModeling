@@ -19,12 +19,16 @@ package org.apache.spark.mllib.topicModeling
 
 import java.util.Random
 
+import org.apache.hadoop.io.NullWritable
+import org.apache.hadoop.mapred.TextOutputFormat
 import org.apache.spark.graphx._
 import org.apache.spark.graphx.impl.GraphImpl
 import org.apache.spark.{HashPartitioner, Logging, Partitioner}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.serializer.KryoRegistrator
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.SparkContext
+import org.apache.hadoop.fs._
 
 import breeze.linalg.{Vector => BV, DenseVector => BDV, SparseVector => BSV, StorageVector,
   sum => brzSum, norm => brzNorm, DenseMatrix => BDM, Matrix => BM, CSCMatrix => BSM}
@@ -35,6 +39,10 @@ import org.apache.spark.mllib.linalg.{DenseVector => SDV, SparseVector => SSV,
 import GibbsLDAOptimizer._
 
 import scala.reflect.ClassTag
+import org.json4s.DefaultFormats
+import org.json4s.JsonDSL._
+import org.json4s.jackson.JsonMethods._
+import org.apache.hadoop.io.{NullWritable, Text}
 
 /**
  *
@@ -78,6 +86,10 @@ class GibbsLDAOptimizer private[topicModeling](
   }
 
   private var lastSampledCorpus:Option[Graph[VD, ED]] = None
+
+  private def termVertices = corpus.vertices.filter(t => t._1>=0)
+
+  private def docVertices = corpus.vertices.filter(t => t._1<0)
 
   /**
    * run an iteration
@@ -180,10 +192,6 @@ class GibbsLDAOptimizer private[topicModeling](
   @transient private var seed = new Random().nextInt()
   @transient private var innerIter = 1
   @transient private var totalTopicCounter: BDV[Count] = null
-
-  private def termVertices = corpus.vertices.filter(t => t._1 >= 0)
-
-  private def docVertices = corpus.vertices.filter(t => t._1 < 0)
 
   // scalastyle:off
   /**
@@ -308,8 +316,8 @@ class GibbsLDAOptimizer private[topicModeling](
     })
 
     ttc.persist(storageLevel)
-    val gtc = ttc.map(_._2).aggregate(BDV.zeros[Count](numTopics))(_ :+= _, _ :+= _)
-    new GibbsLDAModel(gtc, ttc, numTerms, alpha, beta, alphaAS)
+    val gtc = ttc.map(_._2).aggregate(BDV.zeros[Count](numTopics))(_ :+= _,_ :+= _)
+    new GibbsLDAModel(gtc, ttc, corpus.vertices, numTerms, alpha, beta, alphaAS)
   }
 }
 
@@ -357,8 +365,7 @@ object GibbsLDAOptimizer {
   }
 
   def collectGlobalCounter(graph: Graph[VD, ED], numTopics: Int): BDV[Count] = {
-    graph.vertices.filter(t => t._1 >= 0).map(_._2).
-      aggregate(BDV.zeros[Count](numTopics))((a, b) => {
+    graph.vertices.filter(t => t._1 >= 0).map(_._2).aggregate(BDV.zeros[Count](numTopics))((a, b) => {
       a :+= b
     }, _ :+= _)
   }
@@ -426,15 +433,15 @@ object GibbsLDAOptimizer {
 
 class GibbsLDAModel (
     private[topicModeling] val gtc: BDV[Count],
-    private[topicModeling] val ttc: RDD[(VertexId, VD)],
+    @transient private[topicModeling] val ttc: RDD[(VertexId, VD)],
+    @transient private[topicModeling] val vertices: RDD[(VertexId, VD)],
     val numTerms: Int,
     val alpha: Float,
     val beta: Float,
     val alphaAS: Float) extends org.apache.spark.mllib.topicModeling.LDAModel with Serializable {
 
-  @transient private lazy val numTopics = gtc.size
-  @transient private lazy val numTokens = brzSum(gtc).toLong
-
+  private val numTopics = gtc.size
+  private lazy val numTokens = brzSum(gtc).toLong
   /** Number of topics */
   def k: Int = numTopics
 
@@ -462,7 +469,7 @@ class GibbsLDAModel (
         matrix(termId, topicId) = sv(topicId)
       }
     }
-    GibbsLDAOptimizerUtils.fromBreezeMatrix(matrix)
+    GibbsLDAUtils.fromBreezeMatrix(matrix)
   }
 
   /**
@@ -526,6 +533,7 @@ class GibbsLDAModel (
     previousCorpus.vertices.unpersist(blocking = false)
 
     var docTopicCounter: RDD[(VertexId, VD)] = null
+
     for(i <- 1 to totalIter) {
       val previousCorpus = corpus
 
@@ -571,17 +579,35 @@ class GibbsLDAModel (
       if(v.isInstanceOf[BDV[Count]]) {
         val dv = v.asInstanceOf[BDV[Count]]
         val norm = brzNorm(dv, 1)
-        (docId, GibbsLDAOptimizerUtils.fromBreezeConv[Double](dv.map(_.toDouble) / norm ))
+        (docId, GibbsLDAUtils.fromBreezeConv[Double](dv.map(_.toDouble) / norm ))
       } else {
         val sv = v.asInstanceOf[BSV[Count]]
         val norm = brzNorm(sv, 1)
-        (docId, GibbsLDAOptimizerUtils.fromBreezeConv[Double](sv.map(_.toDouble) / norm))
+        (docId, GibbsLDAUtils.fromBreezeConv[Double](sv.map(_.toDouble) / norm))
       }
     }
   }
+
+  /**
+   * For each document in the training set, return the distribution over topics for that document
+   *
+   * @return  RDD of (document ID, topic distribution) pairs
+   */
+  def docTopicDistributions: RDD[(VertexId, VD)] = {
+    vertices.filter(t => t._1<0)
+  }
+
+  /**
+   * For each term in the training set, return the distribution over topics for that term
+   *
+   * @return  RDD of (term ID, topic distribution) pairs
+   */
+  def termTopicDistributions: RDD[(VertexId, VD)] = {
+    vertices.filter(t => t._1>=0)
+  }
 }
 
-private[topicModeling] object GibbsLDAOptimizerUtils {
+private[topicModeling] object GibbsLDAUtils {
 
   private def _conv[T1: ClassTag, T2: ClassTag](data: Array[T1]): Array[T2] = {
     data.map(_.asInstanceOf[T2]).array
@@ -694,6 +720,67 @@ private[topicModeling] object GibbsLDAOptimizerUtils {
       case v: BV[_] =>
         sys.error("Unsupported Breeze vector type: " + v.getClass.getName)
     }
+  }
+
+  def saveLDAModel(sc: SparkContext, ldamodel: GibbsLDAModel, path: String) = {
+    val metadataPath = new Path(path, "metadata").toUri.toString
+    val ttcPath = new Path(path, "ttc").toUri.toString
+    val verticesPath = new Path(path, "vertices").toUri.toString
+
+    val metaData = compact(render
+      (("alpha" -> ldamodel.alpha) ~ ("beta" -> ldamodel.beta) ~
+      ("alphaAS" -> ldamodel.alphaAS) ~ ("numTerms" -> ldamodel.numTerms) ~
+        ("numTopics" -> ldamodel.k)))
+
+    sc.parallelize(Seq(metaData)).saveAsTextFile(metadataPath)
+    ldamodel.ttc.map { case (id, vector) =>
+        val list = vector.activeIterator.toList.sortWith((a, b) => a._2>b._2)
+      (NullWritable.get(), new Text(id + "\t" + list.map(item => item._1 + ":" + item._2).mkString("\t")))
+    }.saveAsHadoopFile[TextOutputFormat[NullWritable, Text]](ttcPath)
+
+    ldamodel.vertices.map { case (id, vector) =>
+      val list = vector.activeIterator.toList.sortWith((a, b) => a._2>b._2)
+      (NullWritable.get(), new Text(id + "\t" + list.map(item => item._1 + ":" + item._2).mkString("\t")))
+    }.saveAsHadoopFile[TextOutputFormat[NullWritable, Text]](verticesPath)
+  }
+
+  def loadLDAModel(sc: SparkContext, path: String): GibbsLDAModel = {
+    val metadataPath = new Path(path, "metadata").toUri.toString
+    val ttcPath = new Path(path, "ttc").toUri.toString
+    val verticesPath = new Path(path, "vertices").toUri.toString
+
+    implicit val formats = DefaultFormats
+    val metaData = parse(sc.textFile(metadataPath).first())
+    val alpha = (metaData \ "alpha").extract[Float]
+    val beta = (metaData \ "beta").extract[Float]
+    val alphaAS = (metaData \ "alphaAS").extract[Float]
+    val numTerms = (metaData \ "numTerms").extract[Int]
+    val numTopics = (metaData \ "numTopics").extract[Int]
+
+    val ttc = sc.textFile(ttcPath).map { line =>
+      val sv = BSV.zeros[Count](numTopics)
+      val arr = line.split("\t")
+      arr.tail.foreach { sub =>
+        val Array(index, value) = sub.split(":")
+        sv(index.toInt) = value.toInt
+      }
+      sv.compact()
+      (arr.head.toLong, sv.asInstanceOf[StorageVector[Count]])
+    }.cache()
+
+    val vertices = sc.textFile(verticesPath).map { line =>
+      val sv = BSV.zeros[Count](numTopics)
+      val arr = line.split("\t")
+      arr.tail.foreach { sub =>
+        val Array(index, value) = sub.split(":")
+        sv(index.toInt) = value.toInt
+      }
+      sv.compact()
+      (arr.head.toLong, sv.asInstanceOf[StorageVector[Count]])
+    }
+
+    val gtc = ttc.map(_._2).aggregate(BDV.zeros[Count](numTopics))(_ :+= _,_ :+= _)
+    new GibbsLDAModel(gtc, ttc, vertices, numTerms, alpha, beta, alphaAS)
   }
 }
 
