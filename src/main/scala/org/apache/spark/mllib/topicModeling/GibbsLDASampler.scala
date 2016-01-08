@@ -435,7 +435,7 @@ class GibbsLDAAliasSampler extends GibbsLDASampler with Logging with Serializabl
     val genSum = gen.nextFloat() * distSum
     if (genSum < dSum) {
       val dGenSum = gen.nextFloat() * dSum
-      val pos = GibbsLDAOptimizerUtils.binarySearchInterval(dData, dGenSum, 0, used, true)
+      val pos = GibbsLDAUtils.binarySearchInterval(dData, dGenSum, 0, used, true)
       docTopicCounter.indexAt(pos)
     } else if (genSum < (dSum + wSum)) {
       sampleSV(gen, w, termTopicCounter, currentTopic)
@@ -565,7 +565,7 @@ class GibbsLDAFastSampler extends GibbsLDASampler with Serializable with Logging
     val genSum = gen.nextFloat() * distSum
     if (genSum < dSum) {
       val dGenSum = gen.nextFloat() * dSum
-      val pos = GibbsLDAOptimizerUtils.binarySearchInterval(dData, dGenSum, 0, used, true)
+      val pos = GibbsLDAUtils.binarySearchInterval(dData, dGenSum, 0, used, true)
       docTopicCounter.indexAt(pos)
     } else if (genSum < (dSum + wSum)) {
       sampleSV(gen, w, termTopicCounter, currentTopic)
