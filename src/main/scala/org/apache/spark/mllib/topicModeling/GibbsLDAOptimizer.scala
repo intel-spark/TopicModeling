@@ -210,30 +210,27 @@ class GibbsLDAOptimizer private[topicModeling](
     val beta = this.beta
     val totalSize = brzSum(totalTopicCounter)
     var totalProb = 0D
-
     // \frac{{\alpha }_{k}{\beta }_{w}}{{n}_{k}+\bar{\beta }}
     totalTopicCounter.activeIterator.foreach { case (topic, cn) =>
       totalProb += alpha * beta / (cn + numTerms * beta)
     }
-
     val termProb = corpus.mapVertices { (vid, counter) =>
-      val probDist = BSV.zeros[Double](numTopics)
+      var probDist = 0D
       if (vid >= 0) {
         val termTopicCounter = counter
         // \frac{{n}_{kw}{\alpha }_{k}}{{n}_{k}+\bar{\beta }}
-        termTopicCounter.activeIterator.foreach { case (topic, cn) =>
-          probDist(topic) = cn * alpha /
+        termTopicCounter.activeIterator.filter(_._2 > 0).foreach { case (topic, cn) =>
+          probDist += cn * alpha /
             (totalTopicCounter(topic) + numTerms * beta)
         }
       } else {
         val docTopicCounter = counter
         // \frac{{n}_{kd}{\beta }_{w}}{{n}_{k}+\bar{\beta }}
-        docTopicCounter.activeIterator.foreach { case (topic, cn) =>
-          probDist(topic) = cn * beta /
+        docTopicCounter.activeIterator.filter(_._2 > 0).foreach { case (topic, cn) =>
+          probDist += cn * beta /
             (totalTopicCounter(topic) + numTerms * beta)
         }
       }
-      probDist.compact()
       (counter, probDist)
     }.mapTriplets { triplet =>
       val (termTopicCounter, termProb) = triplet.srcAttr
@@ -241,18 +238,14 @@ class GibbsLDAOptimizer private[topicModeling](
       val docSize = docTopicCounter.sum
       val docTermSize = triplet.attr.length
       var prob = 0D
-
       // \frac{{n}_{kw}{n}_{kd}}{{n}_{k}+\bar{\beta}}
-      docTopicCounter.activeIterator.foreach { case (topic, cn) =>
-        prob += cn * termTopicCounter(topic) /
-          (totalTopicCounter(topic) + numTerms * beta)
+      docTopicCounter.activeIterator.filter(_._2 > 0).foreach { case (topic, cn) =>
+        prob += ((termTopicCounter(topic) / (totalTopicCounter(topic) + numTerms * beta))*cn)
       }
-      prob += brzSum(docProb) + brzSum(termProb) + totalProb
+      prob += docProb + termProb + totalProb
       prob += prob / (docSize + numTopics * alpha)
-
       docTermSize * Math.log(prob)
     }.edges.map(t => t.attr).sum()
-
     math.exp(-1 * termProb / totalSize)
   }
 
