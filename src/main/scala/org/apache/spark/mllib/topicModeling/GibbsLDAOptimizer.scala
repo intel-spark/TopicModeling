@@ -208,7 +208,8 @@ class GibbsLDAOptimizer private[topicModeling](
     val numTerms = this.numTerms
     val alpha = this.alpha
     val beta = this.beta
-    val totalSize = brzSum(totalTopicCounter)
+
+    val totalSize = brzSum(totalTopicCounter) & 0x00000000FFFFFFFFL
     var totalProb = 0D
     // \frac{{\alpha }_{k}{\beta }_{w}}{{n}_{k}+\bar{\beta }}
     totalTopicCounter.activeIterator.foreach { case (topic, cn) =>
@@ -330,7 +331,9 @@ object GibbsLDAOptimizer {
 
   def collectTotalTopicCounter(graph: Graph[VD, ED], numTopics: Int, numTokens: Long): BDV[Count] = {
     val globalTopicCounter = collectGlobalCounter(graph, numTopics)
-    assert(brzSum(globalTopicCounter) == numTokens)
+    val totalSize = brzSum(globalTopicCounter) & 0x00000000FFFFFFFFL
+    println("numTokens:"+numTokens+" brzSum:"+totalSize)
+    assert(totalSize == numTokens)
     globalTopicCounter
   }
 
@@ -434,7 +437,9 @@ class GibbsLDAModel (
     val alphaAS: Float) extends org.apache.spark.mllib.topicModeling.LDAModel with Serializable {
 
   private val numTopics = gtc.size
-  private lazy val numTokens = brzSum(gtc).toLong
+
+  private lazy val numTokens = brzSum(gtc) & 0x00000000FFFFFFFFL
+
   /** Number of topics */
   def k: Int = numTopics
 
